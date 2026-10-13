@@ -1,0 +1,21 @@
+export interface OfficeLocation {
+  name: string;
+  latitude: number;
+  longitude: number;
+  radiusMeters: number;
+}
+
+export interface LocationPingRequest {
+  attendanceId: string;
+  latitude: number;
+  longitude: number;
+  accuracy: number;
+  timestamp: string;
+  /** Extra GPS samples collected since the last ping — makes distance accurate. */
+  trail?: { latitude: number; longitude: number; accuracy: number; timestamp: string }[];
+}
+
+export interface LocationPingResponse {
+  tracking: boolean;
+  error?: string;
+}

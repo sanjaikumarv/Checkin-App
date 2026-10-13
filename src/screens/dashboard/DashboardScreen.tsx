@@ -1,0 +1,302 @@
+import { useMemo, useState } from "react";
+import { useNavigation } from "@react-navigation/native";
+import type { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import type { BottomTabNavigationProp } from "@react-navigation/bottom-tabs";
+import { StyleSheet, Text, View } from "react-native";
+import { Screen, LoadingView, ErrorView } from "@/components/ui";
+import {
+  PresenceCard,
+  WeeklyHoursChart,
+  LateNoticeCard,
+  PermissionStatusCard,
+  OvertimeStatusCard,
+  LeaveNoticeCard,
+  WorkSegmentCard,
+  FieldVisitCard,
+  LeaveBalanceCard,
+  RecentHistoryCard,
+} from "@/components/dashboard";
+import {
+  useAuth,
+  useAttendanceStatus,
+  useResolvedGeofenceTarget,
+  useGeofence,
+  useRecentAttendance,
+  useTimedPermissions,
+  useOvertimeStatus,
+  useTodayLeave,
+  useWorkSegment,
+  useSwitchWorkSegment,
+} from "@/hooks";
+import { useAttendanceSessionStore } from "@/store/attendanceSessionStore";
+import { startLocationTracking } from "@/services/locationTracking";
+import { groupAttendanceByDay } from "@/utils/attendanceGrouping";
+import { getErrorMessage } from "@/utils/errors";
+import { formatDistance } from "@/utils/geo";
+import { colors, radius, spacing, typography } from "@/theme";
+import type { AppTabParamList, DashboardStackParamList } from "@/navigation/types";
+import type { WorkSegmentMode } from "@/types";
+
+type Nav = NativeStackNavigationProp<DashboardStackParamList, "DashboardHome">;
+
+function formatTime(iso: string | null) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+const WORK_MODE_LABEL: Record<string, string> = {
+  OFFICE: "Office",
+  WFH: "Home",
+  FIELD: "Anywhere",
+};
+
+export function DashboardScreen() {
+  const { user } = useAuth();
+  const navigation = useNavigation<Nav>();
+  const isTracking = useAttendanceSessionStore((s) => s.isTracking);
+  const trackingWarning = useAttendanceSessionStore((s) => s.trackingWarning);
+  const statusQuery = useAttendanceStatus(user?.employeeCode);
+  // Computed off statusQuery.data directly (not the `status` var below,
+  // which is only derived after the loading/error guards) — this hook call
+  // must stay unconditional, so it can't wait for those guards to pass.
+  const hasActiveSession = statusQuery.data?.exists
+    ? statusQuery.data.checkedIn && !statusQuery.data.checkedOut
+    : false;
+  const permissionsQuery = useTimedPermissions(hasActiveSession);
+  const overtimeQuery = useOvertimeStatus(hasActiveSession);
+  const todayLeave = useTodayLeave();
+  const isFieldWorker = user?.workMode === "FIELD";
+  const segmentQuery = useWorkSegment(hasActiveSession && isFieldWorker);
+  const switchSegment = useSwitchWorkSegment();
+  // A WFH employee who chose Office today (see CheckInOutScreen's Home/
+  // Office picker) needs the RANGE stat and PresenceCard geofenced against
+  // the office too, not home — same reasoning as LiveMapScreen's identical
+  // check.
+  const isWfhOfficeDay =
+    user?.workMode === "WFH" && statusQuery.data?.exists === true && statusQuery.data.checkInMode === "OFFICE";
+  const target = useResolvedGeofenceTarget(isWfhOfficeDay ? "OFFICE" : undefined);
+  const geofence = useGeofence(target);
+  const recentQuery = useRecentAttendance(14);
+  const [enablingSharing, setEnablingSharing] = useState(false);
+  const [segmentError, setSegmentError] = useState<string | null>(null);
+
+  const daySummaries = useMemo(
+    () => groupAttendanceByDay(recentQuery.data?.records ?? []),
+    [recentQuery.data],
+  );
+
+  // Today's open (not yet checked out) session, straight from the same
+  // bearer-authenticated history the weekly chart already uses — lets us
+  // (re)start tracking without needing the attendance id from anywhere else.
+  // Deliberately not sourced from /api/kiosk/status: that endpoint is
+  // PIN-less (keyed only by employee code) and the attendance id doubles as
+  // an unguessable capability token for location pings, so it must never be
+  // handed out unauthenticated.
+  const todayKey = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  })();
+  const activeCheckIn = daySummaries.find((d) => d.dateKey === todayKey && !d.checkOut)?.checkIn ?? null;
+
+  if (statusQuery.isLoading) return <LoadingView label="Loading your status…" />;
+  if (statusQuery.isError) {
+    return (
+      <ErrorView
+        message={getErrorMessage(statusQuery.error, "Couldn't load today's status.")}
+        onRetry={() => statusQuery.refetch()}
+      />
+    );
+  }
+
+  const status = statusQuery.data;
+  const checkedIn = status?.exists ? status.checkedIn : false;
+  const checkedOut = status?.exists ? status.checkedOut : false;
+  const checkInAt = status?.exists ? status.checkInAt : null;
+  const isPaused = status?.exists ? status.isPaused : false;
+  const leaveType = status?.exists ? status.leaveType : "NONE";
+  const lateMinutes = status?.exists ? status.lateMinutes : null;
+
+  // Whichever of today's timed-permission requests is currently relevant —
+  // for display, that's the most recent non-resolved one (a rejected one is
+  // still worth showing so the employee sees the decline).
+  const permissions = hasActiveSession ? permissionsQuery.data ?? [] : [];
+  const currentPermission = permissions.find((p) => p.status !== "resolved") ?? null;
+  const pauseReason: "geofence" | "permission" = currentPermission?.status === "active" ? "permission" : "geofence";
+
+  // The active overtime request, if any — "active" (not yet closed out at a
+  // checkout) is the only thing that matters for showing this and hiding
+  // the request button; unlike TimedPermission's status, `status` here
+  // never affects whether one exists (see the type's own comment).
+  const overtimeRequests = hasActiveSession ? overtimeQuery.data ?? [] : [];
+  const currentOvertime = overtimeRequests.find((r) => r.active) ?? null;
+
+  const rangeLabel =
+    user?.workMode === "FIELD"
+      ? "Anywhere"
+      : geofence.distanceMeters !== null
+        ? formatDistance(geofence.distanceMeters)
+        : "—";
+
+  const goCheckInOut = () => {
+    navigation.getParent<BottomTabNavigationProp<AppTabParamList>>()?.navigate("CheckIn");
+  };
+
+  // startLocationTracking never throws — every failure mode (permission
+  // denied, native task error) is surfaced via the store's trackingWarning
+  // instead, which PresenceCard already renders. `enablingSharing` here is
+  // purely for the button's own loading state.
+  const handleEnableSharing = async () => {
+    if (!activeCheckIn) return;
+    setEnablingSharing(true);
+    await startLocationTracking(activeCheckIn.id, activeCheckIn.timestamp);
+    setEnablingSharing(false);
+  };
+
+  const handleSwitchSegment = async (mode: WorkSegmentMode) => {
+    setSegmentError(null);
+    try {
+      await switchSegment.mutateAsync(mode);
+    } catch (error) {
+      setSegmentError(getErrorMessage(error, "Couldn't switch your mode. Please try again."));
+    }
+  };
+
+  const initials = (user?.name ?? "?")
+    .split(" ")
+    .map((p) => p[0])
+    .slice(0, 2)
+    .join("")
+    .toUpperCase();
+
+  return (
+    <Screen scroll onRefresh={() => statusQuery.refetch()} refreshing={statusQuery.isRefetching}>
+      <View style={styles.headerRow}>
+        <View>
+          <Text style={styles.kicker}>
+            {new Date()
+              .toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })
+              .toUpperCase()}
+            {"  ·  "}
+            {new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+          </Text>
+          <Text style={styles.greeting}>{user?.name?.split(" ")[0] ?? "there"}</Text>
+        </View>
+        <View style={styles.avatar}>
+          <Text style={styles.avatarLabel}>{initials}</Text>
+        </View>
+      </View>
+
+      {!checkedIn && todayLeave ? <LeaveNoticeCard type={todayLeave.type} /> : null}
+
+      <PresenceCard
+        isTracking={isTracking}
+        checkInAt={checkedIn && !checkedOut ? checkInAt : null}
+        isPaused={checkedIn && !checkedOut ? isPaused : false}
+        pauses={checkedIn && !checkedOut && status?.exists ? status.pauses : []}
+        pauseReason={pauseReason}
+        trackingWarning={trackingWarning}
+        onViewMap={() => navigation.navigate("LiveMap")}
+        onEnableSharing={!isTracking && activeCheckIn ? handleEnableSharing : undefined}
+        enablingSharing={enablingSharing}
+        checkedIn={checkedIn && !checkedOut}
+        onPrimaryAction={goCheckInOut}
+      />
+
+      {checkedIn && !checkedOut && isFieldWorker && segmentQuery.data?.mode ? (
+        <>
+          <WorkSegmentCard
+            mode={segmentQuery.data.mode}
+            onSwitch={handleSwitchSegment}
+            switching={switchSegment.isPending}
+          />
+          {segmentError ? <Text style={styles.segmentError}>{segmentError}</Text> : null}
+        </>
+      ) : null}
+
+      {checkedIn && !checkedOut && isFieldWorker ? <FieldVisitCard /> : null}
+
+      {checkedIn && !checkedOut && currentPermission ? (
+        <PermissionStatusCard permission={currentPermission} />
+      ) : null}
+
+      {checkedIn && !checkedOut && currentOvertime ? (
+        <OvertimeStatusCard request={currentOvertime} />
+      ) : null}
+
+      <View style={styles.statGrid}>
+        <View style={styles.statCell}>
+          <Text style={styles.statLabel}>IN AT</Text>
+          <Text style={styles.statValue}>{formatTime(checkInAt)}</Text>
+        </View>
+        <View style={[styles.statCell, styles.statCellMiddle]}>
+          <Text style={styles.statLabel}>MODE</Text>
+          <Text style={styles.statValue}>{WORK_MODE_LABEL[user?.workMode ?? "OFFICE"]}</Text>
+        </View>
+        <View style={styles.statCell}>
+          <Text style={styles.statLabel}>RANGE</Text>
+          <Text style={[styles.statValue, geofence.withinRadius === false && styles.statValueWarn]}>
+            {rangeLabel}
+          </Text>
+        </View>
+      </View>
+
+      {leaveType !== "NONE" ? <LateNoticeCard leaveType={leaveType} lateMinutes={lateMinutes} /> : null}
+
+      <View style={styles.weeklyCard}>
+        <WeeklyHoursChart days={daySummaries} />
+      </View>
+
+      <RecentHistoryCard
+        days={daySummaries}
+        onSeeAll={() =>
+          navigation.getParent<BottomTabNavigationProp<AppTabParamList>>()?.navigate("Profile", { screen: "History" })
+        }
+      />
+
+      <LeaveBalanceCard
+        onPress={() =>
+          navigation.getParent<BottomTabNavigationProp<AppTabParamList>>()?.navigate("Requests", { tab: "leave" })
+        }
+      />
+    </Screen>
+  );
+}
+
+const styles = StyleSheet.create({
+  headerRow: { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between" },
+  kicker: { ...typography.label, letterSpacing: 2, color: colors.textSecondary },
+  greeting: { ...typography.h1, color: colors.textPrimary, marginTop: spacing.xs + 2 },
+  avatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 99,
+    backgroundColor: colors.surfaceMuted,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  avatarLabel: { ...typography.bodyStrong, color: colors.textSecondary },
+  statGrid: {
+    flexDirection: "row",
+    marginTop: spacing.md,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    overflow: "hidden",
+  },
+  statCell: { flex: 1, backgroundColor: colors.surface, padding: spacing.sm + 5 },
+  statCellMiddle: { borderLeftWidth: 1, borderRightWidth: 1, borderColor: colors.border },
+  statLabel: { fontSize: 9, letterSpacing: 1.5, color: colors.textMuted, fontWeight: "600" },
+  statValue: { ...typography.bodyStrong, color: colors.textPrimary, marginTop: spacing.xs + 2 },
+  statValueWarn: { color: colors.danger },
+  weeklyCard: {
+    marginTop: spacing.lg,
+    backgroundColor: colors.surface,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.md,
+  },
+  segmentError: { ...typography.caption, color: colors.danger, marginTop: spacing.xs },
+});
